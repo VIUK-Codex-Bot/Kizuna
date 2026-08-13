@@ -2630,6 +2630,204 @@ final class KizunaAITests: XCTestCase {
         )
     }
 
+    func testStoryTurnJournalUsesPairOrderingMatrix() throws {
+        enum Ordering: Equatable {
+            case older
+            case equal
+            case newer
+        }
+
+        let cases: [(name: String, session: Ordering, scene: Ordering, retains: Bool)] = [
+            ("older/older", .older, .older, false),
+            ("older/equal", .older, .equal, false),
+            ("older/newer", .older, .newer, true),
+            ("equal/older", .equal, .older, false),
+            ("equal/equal", .equal, .equal, false),
+            ("equal/newer", .equal, .newer, false),
+            ("newer/older", .newer, .older, true),
+            ("newer/equal", .newer, .equal, false),
+            ("newer/newer", .newer, .newer, false)
+        ]
+
+        func makePersistedSession(
+            from journal: StorySession,
+            ordering: Ordering
+        ) -> StorySession {
+            var persisted = journal
+            switch ordering {
+            case .older:
+                persisted.persistenceRevision = journal.effectivePersistenceRevision + 1
+                persisted.updatedAt = journal.updatedAt.addingTimeInterval(1)
+                persisted.lastTurnProgress = "persisted newer session"
+            case .equal:
+                break
+            case .newer:
+                persisted.persistenceRevision = journal.effectivePersistenceRevision - 1
+                persisted.updatedAt = journal.updatedAt.addingTimeInterval(-1)
+                persisted.lastTurnProgress = "persisted older session"
+            }
+            return persisted
+        }
+
+        func makePersistedScene(
+            from journal: StoryScene,
+            ordering: Ordering
+        ) -> StoryScene {
+            var persisted = journal
+            switch ordering {
+            case .older:
+                persisted.persistenceRevision = journal.effectivePersistenceRevision + 1
+                persisted.updatedAt = journal.updatedAt.addingTimeInterval(1)
+                persisted.summary = "persisted newer scene"
+            case .equal:
+                break
+            case .newer:
+                persisted.persistenceRevision = journal.effectivePersistenceRevision - 1
+                persisted.updatedAt = journal.updatedAt.addingTimeInterval(-1)
+                persisted.summary = "persisted older scene"
+            }
+            return persisted
+        }
+
+        for testCase in cases {
+            let storageURL = try makeStoryPersistenceTestDirectory()
+            let fixture = makeCommittedJournalFixture()
+            let persistedSession = makePersistedSession(
+                from: fixture.entry.session,
+                ordering: testCase.session
+            )
+            let persistedScene = makePersistedScene(
+                from: fixture.entry.scene,
+                ordering: testCase.scene
+            )
+
+            try LocalJSONStoreTransaction.save(
+                [persistedSession],
+                fileName: "story_sessions.json",
+                baseURL: storageURL
+            )
+            try LocalJSONStoreTransaction.save(
+                [persistedScene],
+                fileName: "story_scenes.json",
+                baseURL: storageURL
+            )
+            try LocalJSONStoreTransaction.save(
+                [fixture.entry],
+                fileName: "story_turn_journal.json",
+                baseURL: storageURL
+            )
+
+            try StoryTurnJournal.recoverIfNeeded(baseURL: storageURL)
+
+            let recoveredSession = try XCTUnwrap(
+                LocalJSONStoreTransaction.load(
+                    StorySession.self,
+                    fileName: "story_sessions.json",
+                    baseURL: storageURL
+                ).first
+            )
+            let recoveredScene = try XCTUnwrap(
+                LocalJSONStoreTransaction.load(
+                    StoryScene.self,
+                    fileName: "story_scenes.json",
+                    baseURL: storageURL
+                ).first
+            )
+            let expectedSession = testCase.session == .newer
+                ? fixture.entry.session
+                : persistedSession
+            let expectedScene = testCase.scene == .newer
+                ? fixture.entry.scene
+                : persistedScene
+            XCTAssertEqual(recoveredSession, expectedSession, testCase.name)
+            XCTAssertEqual(recoveredScene, expectedScene, testCase.name)
+
+            let remainingEntries = try LocalJSONStoreTransaction.load(
+                StoryTurnJournalEntry.self,
+                fileName: "story_turn_journal.json",
+                baseURL: storageURL
+            )
+            if testCase.retains {
+                XCTAssertEqual(remainingEntries, [fixture.entry], testCase.name)
+            } else {
+                XCTAssertTrue(remainingEntries.isEmpty, testCase.name)
+            }
+        }
+    }
+
+    func testStoryTurnJournalRetainsSameMetadataWithDifferentPayload() throws {
+        enum AmbiguousRecord {
+            case session
+            case scene
+        }
+
+        for record in [AmbiguousRecord.session, .scene] {
+            let storageURL = try makeStoryPersistenceTestDirectory()
+            let fixture = makeCommittedJournalFixture()
+            var persistedSession = fixture.entry.session
+            var persistedScene = fixture.entry.scene
+            switch record {
+            case .session:
+                persistedSession.lastTurnProgress = "同じ世代だが別のSession payload"
+            case .scene:
+                persistedScene.summary = "同じ世代だが別のScene payload"
+            }
+
+            try LocalJSONStoreTransaction.save(
+                [persistedSession],
+                fileName: "story_sessions.json",
+                baseURL: storageURL
+            )
+            try LocalJSONStoreTransaction.save(
+                [persistedScene],
+                fileName: "story_scenes.json",
+                baseURL: storageURL
+            )
+            try LocalJSONStoreTransaction.save(
+                [fixture.entry],
+                fileName: "story_turn_journal.json",
+                baseURL: storageURL
+            )
+
+            try StoryTurnJournal.recoverIfNeeded(baseURL: storageURL)
+            XCTAssertEqual(
+                try LocalJSONStoreTransaction.load(
+                    StoryTurnJournalEntry.self,
+                    fileName: "story_turn_journal.json",
+                    baseURL: storageURL
+                ),
+                [fixture.entry]
+            )
+            XCTAssertEqual(
+                try LocalJSONStoreTransaction.load(
+                    StorySession.self,
+                    fileName: "story_sessions.json",
+                    baseURL: storageURL
+                ).first,
+                persistedSession
+            )
+            XCTAssertEqual(
+                try LocalJSONStoreTransaction.load(
+                    StoryScene.self,
+                    fileName: "story_scenes.json",
+                    baseURL: storageURL
+                ).first,
+                persistedScene
+            )
+
+            try StoryTurnJournal.recoverIfNeeded(baseURL: storageURL)
+            XCTAssertEqual(
+                try LocalJSONStoreTransaction.load(
+                    StoryTurnJournalEntry.self,
+                    fileName: "story_turn_journal.json",
+                    baseURL: storageURL
+                ),
+                [fixture.entry],
+                "an ambiguous pair must remain recoverable after a repeated recovery"
+            )
+        }
+    }
+
     func testStoryTurnJournalRetainsConflictingPairButHandsOffMemory() throws {
         func assertConflictIsRetained(sessionIsNewer: Bool) throws {
             let storageURL = try makeStoryPersistenceTestDirectory()
@@ -2785,6 +2983,134 @@ final class KizunaAITests: XCTestCase {
 
         try assertConflictIsRetained(sessionIsNewer: true)
         try assertConflictIsRetained(sessionIsNewer: false)
+    }
+
+    func testStoryTurnJournalTombstoneDiscardsPairWithoutMemoryRetryHandoff() throws {
+        for recordKind in [StoryTurnJournalRecordKind.session, .scene] {
+            let storageURL = try makeStoryPersistenceTestDirectory()
+            let fixture = makeCommittedJournalFixture()
+            var persistedSession = fixture.persistedSession
+            persistedSession.persistenceRevision = 3
+            persistedSession.updatedAt = fixture.entry.session.updatedAt.addingTimeInterval(1)
+            persistedSession.lastTurnProgress = "後続のSession"
+            var persistedScene = fixture.persistedScene
+            persistedScene.persistenceRevision = 1
+            persistedScene.summary = "古いScene"
+
+            let userMessageID = try XCTUnwrap(
+                fixture.entry.session.latestTurnCheckpoint?.userMessageID
+            )
+            let retry = StoryMemoryRetry(
+                turnID: fixture.entry.turnID,
+                userMessageID: userMessageID,
+                userText: "tombstone pair",
+                characterMemories: [],
+                storyMemories: [],
+                storySessionID: fixture.entry.session.id,
+                storyWorldID: fixture.entry.session.storyWorldId
+            )
+            let entry = StoryTurnJournalEntry(
+                turnID: fixture.entry.turnID,
+                session: fixture.entry.session,
+                scene: fixture.entry.scene,
+                memoryRetries: [retry]
+            )
+            let tombstone = StoryTurnJournalTombstone(
+                recordID: recordKind == .session
+                    ? fixture.entry.session.id
+                    : fixture.entry.scene.id,
+                recordKind: recordKind,
+                deletedAt: Date(timeIntervalSince1970: 500)
+            )
+
+            try LocalJSONStoreTransaction.save(
+                [persistedSession],
+                fileName: "story_sessions.json",
+                baseURL: storageURL
+            )
+            try LocalJSONStoreTransaction.save(
+                [persistedScene],
+                fileName: "story_scenes.json",
+                baseURL: storageURL
+            )
+            try LocalJSONStoreTransaction.save(
+                [entry],
+                fileName: "story_turn_journal.json",
+                baseURL: storageURL
+            )
+            try LocalJSONStoreTransaction.save(
+                [retry],
+                fileName: "story_memory_retries.json",
+                baseURL: storageURL
+            )
+            try LocalJSONStoreTransaction.save(
+                [tombstone],
+                fileName: "story_turn_journal_tombstones.json",
+                baseURL: storageURL
+            )
+
+            try StoryTurnJournal.recoverIfNeeded(baseURL: storageURL)
+
+            XCTAssertTrue(
+                try LocalJSONStoreTransaction.load(
+                    StoryTurnJournalEntry.self,
+                    fileName: "story_turn_journal.json",
+                    baseURL: storageURL
+                ).isEmpty,
+                "a tombstoned pair must not remain active"
+            )
+            XCTAssertTrue(
+                try LocalJSONStoreTransaction.load(
+                    StoryMemoryRetry.self,
+                    fileName: "story_memory_retries.json",
+                    baseURL: storageURL
+                ).isEmpty,
+                "a tombstoned pair must not hand off its journal retry"
+            )
+            if recordKind == .session {
+                XCTAssertTrue(
+                    try LocalJSONStoreTransaction.load(
+                        StorySession.self,
+                        fileName: "story_sessions.json",
+                        baseURL: storageURL
+                    ).isEmpty
+                )
+                XCTAssertEqual(
+                    try LocalJSONStoreTransaction.load(
+                        StoryScene.self,
+                        fileName: "story_scenes.json",
+                        baseURL: storageURL
+                    ).first,
+                    persistedScene
+                )
+            } else {
+                XCTAssertEqual(
+                    try LocalJSONStoreTransaction.load(
+                        StorySession.self,
+                        fileName: "story_sessions.json",
+                        baseURL: storageURL
+                    ).first,
+                    persistedSession
+                )
+                XCTAssertTrue(
+                    try LocalJSONStoreTransaction.load(
+                        StoryScene.self,
+                        fileName: "story_scenes.json",
+                        baseURL: storageURL
+                    ).isEmpty
+                )
+            }
+
+            try StoryTurnJournal.recoverIfNeeded(baseURL: storageURL)
+            XCTAssertTrue(
+                try LocalJSONStoreTransaction.load(
+                    StoryMemoryRetry.self,
+                    fileName: "story_memory_retries.json",
+                    baseURL: storageURL
+                ).isEmpty,
+                "recovery must not resurrect a tombstoned retry"
+            )
+        }
     }
 
     func testStoryTurnJournalDoesNotOverwritePartialMemoryRetryWithStalePayload() throws {

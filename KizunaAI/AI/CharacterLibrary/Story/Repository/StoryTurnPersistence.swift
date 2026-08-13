@@ -178,6 +178,11 @@ enum StoryTurnJournal {
     private enum RecordOrdering: Equatable {
         case older
         case equal
+        /// The revision and timestamp are identical, but the payload differs.
+        /// A journal entry cannot safely win this tie without a stronger
+        /// provenance marker, so the enclosing session/scene pair must stay
+        /// recoverable instead of being consumed.
+        case ambiguous
         case newer
     }
 
@@ -294,6 +299,10 @@ enum StoryTurnJournal {
                     NSLog(
                         "[StoryTurnJournal] discarded tombstoned entry turn=%@",
                         entry.turnID.uuidString
+                    )
+                    try purgeMemoryRetriesForTurnIDsUnlocked(
+                        Set([entry.turnID]),
+                        baseURL: baseURL
                     )
                     continue
                 }
@@ -494,6 +503,8 @@ enum StoryTurnJournal {
         let sceneOrdering = ordering(entry.scene, over: persistedScene)
 
         switch (sessionOrdering, sceneOrdering) {
+        case (.ambiguous, _), (_, .ambiguous):
+            return .retain
         case (.newer, .older), (.older, .newer):
             return .retain
         case (.newer, _), (_, .newer):
@@ -512,7 +523,9 @@ enum StoryTurnJournal {
                 ? .newer
                 : .older
         }
-        if journal.updatedAt == persisted.updatedAt { return .equal }
+        if journal.updatedAt == persisted.updatedAt {
+            return journal == persisted ? .equal : .ambiguous
+        }
         return journal.updatedAt > persisted.updatedAt ? .newer : .older
     }
 
@@ -535,7 +548,9 @@ enum StoryTurnJournal {
                 ? .newer
                 : .older
         }
-        if journal.updatedAt == persisted.updatedAt { return .equal }
+        if journal.updatedAt == persisted.updatedAt {
+            return journal == persisted ? .equal : .ambiguous
+        }
         return journal.updatedAt > persisted.updatedAt ? .newer : .older
     }
 
@@ -588,6 +603,25 @@ enum StoryTurnJournal {
         let retained = existing.filter { retry in
             !retry.isCompleted || keepingTurnIDs.contains(retry.turnID)
         }
+        guard retained.count != existing.count else { return }
+        try LocalJSONStoreTransaction.save(
+            retained,
+            fileName: memoryRetryFileName,
+            baseURL: baseURL
+        )
+    }
+
+    /// A tombstoned session is handled during tombstone reconciliation, but a
+    /// scene can be deleted independently. Once the paired turn is discarded,
+    /// remove any already-handed-off retry for that turn as well; otherwise a
+    /// later retry pass could resurrect memory from a deleted pair.
+    private static func purgeMemoryRetriesForTurnIDsUnlocked(
+        _ turnIDs: Set<UUID>,
+        baseURL: URL
+    ) throws {
+        guard !turnIDs.isEmpty else { return }
+        let existing = try loadMemoryRetriesUnlocked(baseURL: baseURL)
+        let retained = existing.filter { !turnIDs.contains($0.turnID) }
         guard retained.count != existing.count else { return }
         try LocalJSONStoreTransaction.save(
             retained,
